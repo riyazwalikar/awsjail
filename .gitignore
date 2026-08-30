@@ -1,0 +1,14 @@
+/awsjail
+/awsjail-admin
+*.test
+*.out
+
+.DS_Store
+
+.claude/
+.remember/
+
+spec.md
+keys/
+demo-state.env
+docs/superpowers
