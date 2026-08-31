@@ -78,24 +78,46 @@ if [[ $NEED_GO -eq 1 ]]; then
   export PATH="/usr/local/go/bin:$PATH"
 fi
 
-# 3. AWS CLI v2
-NEED_AWS=1
-if [[ -x /usr/local/bin/aws ]] && /usr/local/bin/aws --version 2>&1 | grep -q "aws-cli/2\."; then
-  NEED_AWS=0
-  step "aws cli v2: already installed, skipping"
+# 3. AWS CLI v2 (pinned)
+#
+# The CLI's custom commands are part of the jail's attack surface, so the
+# version is pinned and the installer checksum-verified. To upgrade:
+#   1. bump AWS_CLI_VERSION;
+#   2. download awscli-exe-linux-<arch>-<version>.zip for both arches and
+#      replace the two SHA256 values below (`sha256sum` / `shasum -a 256`);
+#   3. review the release's custom-command changes before rolling out.
+AWS_CLI_VERSION="2.36.34"
+AWS_CLI_SHA256_X86_64="c15dd1f18b1794431d9746c0fab74e9e236bea5eb163bc0d2f1ec179d169f9cb"
+AWS_CLI_SHA256_AARCH64="2b9d9305db94af64baee48106f54b6652ede5732494c0ba61ae305720ac72505"
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64)  AWSARCH="x86_64";  AWS_CLI_SHA256="$AWS_CLI_SHA256_X86_64" ;;
+  aarch64) AWSARCH="aarch64"; AWS_CLI_SHA256="$AWS_CLI_SHA256_AARCH64" ;;
+  *) echo "setup.sh: unsupported architecture $ARCH for aws cli" >&2; exit 1 ;;
+esac
+
+INSTALLED_AWS_VER=""
+if [[ -x /usr/local/bin/aws ]]; then
+  INSTALLED_AWS_VER="$(/usr/local/bin/aws --version 2>&1 | sed -E 's#^aws-cli/([0-9.]+).*#\1#')"
 fi
-if [[ $NEED_AWS -eq 1 ]]; then
-  ARCH="$(uname -m)"
-  case "$ARCH" in
-    x86_64) AWSARCH="x86_64" ;;
-    aarch64) AWSARCH="aarch64" ;;
-    *) echo "setup.sh: unsupported architecture $ARCH for aws cli" >&2; exit 1 ;;
-  esac
+if [[ "$INSTALLED_AWS_VER" == "$AWS_CLI_VERSION" ]]; then
+  step "aws cli v2: pinned version $AWS_CLI_VERSION already installed, skipping"
+else
+  if [[ -n "$INSTALLED_AWS_VER" ]]; then
+    step "aws cli v2: found $INSTALLED_AWS_VER, replacing with pinned $AWS_CLI_VERSION"
+  else
+    step "installing AWS CLI v2 $AWS_CLI_VERSION (${AWSARCH})"
+  fi
   TMP_AWS_DIR="$(mktemp -d)"
-  step "installing AWS CLI v2 (${AWSARCH})"
-  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWSARCH}.zip" -o "$TMP_AWS_DIR/awscliv2.zip"
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWSARCH}-${AWS_CLI_VERSION}.zip" -o "$TMP_AWS_DIR/awscliv2.zip"
+  echo "$AWS_CLI_SHA256  $TMP_AWS_DIR/awscliv2.zip" | sha256sum -c -
   unzip -q "$TMP_AWS_DIR/awscliv2.zip" -d "$TMP_AWS_DIR"
-  "$TMP_AWS_DIR/aws/install" --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+  # Fresh install: the installer's --update mode refuses downgrades, and a
+  # pinned version may legitimately be older than what is on the box.
+  rm -rf /usr/local/aws-cli
+  rm -f /usr/local/bin/aws /usr/local/bin/aws_completer
+  "$TMP_AWS_DIR/aws/install" --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli
   rm -rf "$TMP_AWS_DIR"
 fi
 

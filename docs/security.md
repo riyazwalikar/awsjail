@@ -66,6 +66,14 @@ can't be used off the box, and the creds are only the user's own scoped role.
 - `aws configure export-credentials` — the CLI's built-in "print my current
   credentials" command — is denied at the shell in every output format, so the
   assumed-role STS creds injected into the child stay out of the terminal.
+  Detection parses the command structure (service `configure`, operation
+  `export-credentials`), so files or objects merely *named* `configure` or
+  `export-credentials` still work.
+- Local path arguments resolving to `/proc` or `/sys` are denied, because
+  `aws s3 cp /proc/self/environ -` (or `fileb:///proc/self/environ`) would
+  make the CLI read its own environment — injected creds included — to the
+  terminal or an S3 object, bypassing the export-credentials block. Ordinary
+  file operations (`aws s3 cp /tmp/x s3://b/`) are unaffected.
 - The AWS CLI child's `PATH` is a single root-owned directory
   (`/usr/local/lib/awsjail/bin`) that starts empty, so CLI customizations that
   spawn helpers (EMR `ssh`/`scp`, CodeArtifact's `npm`/`pip`/`dotnet`, the SSM
@@ -111,10 +119,11 @@ Read these before an audit finds them for you.
   when IAM permits them. Whether a user may mint them is an IAM decision;
   awsjail does not block them (see
   [iam.md](iam.md#what-iam-decides-not-the-shell)).
-- **AWS CLI version is not pinned.** `setup.sh` accepts any installed CLI v2
-  or fetches the current release. The CLI's custom commands are part of the
-  jail's attack surface, so pin an exact release, verify its checksum, and
-  review custom-command changes before upgrading.
+- **AWS CLI upgrades are manual change control.** The CLI is pinned
+  (`AWS_CLI_VERSION` in `setup.sh`, SHA256-verified), so AWS releasing a new
+  CLI never silently changes the jail's behavior. The flip side: security
+  fixes in the CLI itself only arrive when you deliberately bump the pin —
+  track AWS CLI releases and review custom-command changes before bumping.
 
 ## v2 hardening
 
@@ -151,6 +160,6 @@ Read these before an audit finds them for you.
 3. **Session TTL.** Creds are 1h (`sessionTTL`). For longer sessions raise
    `--duration-seconds` up to the role's max session duration, or add
    re-assume-on-expiry to the REPL loop.
-4. **AWS CLI pinning.** Define an exact CLI version, use the versioned
-   installer artifact, verify its checksum/signature, and require an explicit
-   source change to upgrade.
+4. **AWS CLI pinning.** Done: `setup.sh` pins `AWS_CLI_VERSION`, downloads
+   the version-specific installer, and verifies an embedded SHA256. Upgrades
+   are a deliberate source change with a checksum refresh — keep it that way.

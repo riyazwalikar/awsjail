@@ -11,9 +11,12 @@
 //     is ever involved, so ; | & $() and backticks are never interpreted. This
 //     is also why JMESPath --query strings with | and backticks work: they are
 //     passed to aws as literal argv.
-//   - Only argv[0] == "aws" is allowed, with one exception inside that: `aws
+//   - Only argv[0] == "aws" is allowed, with two exceptions inside that: `aws
 //     configure export-credentials` is denied, because it exists specifically
-//     to print the credentials awsjail injected into the child environment.
+//     to print the credentials awsjail injected into the child environment,
+//     and local path arguments under /proc or /sys are denied, because
+//     `aws s3 cp /proc/self/environ -` would read the CLI's own environment —
+//     creds included — straight to the terminal or an S3 object.
 //   - The child environment is built from scratch. PATH is a dedicated
 //     root-owned helper directory with no general-purpose executables, so AWS
 //     CLI customizations (EMR ssh, CodeArtifact login, ...) cannot discover
@@ -37,6 +40,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -238,20 +242,85 @@ func buildEnv(c creds, region string) []string {
 	}
 }
 
+// awsGlobalValueOpts are the AWS CLI v2 global options that consume a
+// separate value token (`--region us-east-1`). Everything else starting with
+// `--` is treated as a flag, and `--opt=value` is self-contained. Only global
+// options can appear before the service token in a valid invocation, so this
+// list is the complete skip set needed to find the service and operation.
+var awsGlobalValueOpts = map[string]bool{
+	"ca-bundle": true, "cli-binary-format": true, "cli-connect-timeout": true,
+	"cli-read-timeout": true, "color": true, "endpoint-url": true,
+	"output": true, "profile": true, "query": true, "region": true,
+}
+
+// positionals returns the non-option tokens of a parsed aws argv (excluding
+// argv[0]), skipping global options and their values. For a well-formed
+// command, positionals[0] is the service and positionals[1] the operation.
+func positionals(argv []string) []string {
+	var out []string
+	for i := 1; i < len(argv); i++ {
+		tok := argv[i]
+		if strings.HasPrefix(tok, "--") {
+			name := tok[2:]
+			if strings.Contains(name, "=") {
+				continue // --opt=value is self-contained
+			}
+			if awsGlobalValueOpts[name] {
+				i++ // skip the option's value
+			}
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
 // isCredentialExport reports whether a parsed aws command is
 // `configure export-credentials`, the CLI's built-in way to print the
-// credentials of the current session. Matching is on exact tokens, in order,
-// tolerating global options anywhere: a token exactly "configure" followed by
-// a later token exactly "export-credentials". It deliberately ignores argv[0]
-// (already known to be "aws") and never substring-matches user values.
+// credentials of the current session. It parses the command structure —
+// service token, then operation token, tolerating global options in any
+// position — rather than scanning all tokens, so `configure` or
+// `export-credentials` appearing as argument values (file names, object
+// keys, user names) do not trigger it. argv[0] is already known to be "aws".
 func isCredentialExport(argv []string) bool {
-	seenConfigure := false
+	pos := positionals(argv)
+	return len(pos) >= 2 && pos[0] == "configure" && pos[1] == "export-credentials"
+}
+
+// sensitivePrefixes are filesystem roots the AWS CLI must never read from or
+// write to. /proc is the security-critical one: a command like
+// `aws s3 cp /proc/self/environ -` makes the CLI read its own environment —
+// which contains the injected AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN —
+// and stream it to the terminal or an S3 object, bypassing the
+// export-credentials block. /sys is blocked on the same principle.
+var sensitivePrefixes = []string{"/proc", "/sys"}
+
+// isSensitiveLocalPath reports whether any token in argv refers to a local
+// path under a sensitive prefix, as a plain path or a file:// / fileb://
+// parameter. Tokens are resolved against cwd so `../../proc/self/environ`
+// cannot slip past an absolute-path check. Ordinary absolute paths
+// (/tmp/upload.tar.gz) and non-local arguments (s3:// URIs, JMESPath) are
+// unaffected.
+func isSensitiveLocalPath(argv []string, cwd string) bool {
 	for _, tok := range argv[1:] {
-		switch tok {
-		case "configure":
-			seenConfigure = true
-		case "export-credentials":
-			if seenConfigure {
+		p := tok
+		if rest, ok := strings.CutPrefix(p, "fileb://"); ok {
+			p = rest
+		} else if rest, ok := strings.CutPrefix(p, "file://"); ok {
+			p = rest
+		}
+		var abs string
+		switch {
+		case strings.HasPrefix(p, "/"):
+			abs = p
+		case strings.HasPrefix(p, ".."):
+			abs = filepath.Join(cwd, p)
+		default:
+			continue
+		}
+		abs = filepath.Clean(abs)
+		for _, sp := range sensitivePrefixes {
+			if abs == sp || strings.HasPrefix(abs, sp+"/") {
 				return true
 			}
 		}
@@ -279,6 +348,12 @@ func runOne(line string, env []string, sl logger, username, src string) int {
 	if isCredentialExport(argv) {
 		fmt.Fprintln(os.Stderr, "awsjail: 'aws configure export-credentials' is not permitted")
 		sl.Warning(logLine(username, src, line, -1, "denied", "credential_export"))
+		return 127
+	}
+	cwd, _ := os.Getwd()
+	if isSensitiveLocalPath(argv, cwd) {
+		fmt.Fprintln(os.Stderr, "awsjail: paths under /proc and /sys are not permitted")
+		sl.Warning(logLine(username, src, line, -1, "denied", "sensitive_path"))
 		return 127
 	}
 	cmd := exec.Command(awsBin, argv[1:]...)

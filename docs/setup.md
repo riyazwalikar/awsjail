@@ -70,10 +70,13 @@ this non-interactively, and `--skip-sshd-reload` if you want to review
 
 ### What `setup.sh` does
 
-- Installs Go (official tarball) and the AWS CLI v2 (official installer) if
-  they're missing or the wrong version — never via `apt`. The CLI is part of
-  the jail's attack surface, so treat upgrades as deliberate change control:
-  pin a specific release and review custom-command changes before bumping.
+- Installs Go (official tarball) and the AWS CLI v2 — pinned to an exact
+  version (`AWS_CLI_VERSION` in `setup.sh`), downloaded from the
+  version-specific AWS URL and verified against an embedded SHA256 — never
+  via `apt` and never "whatever is latest". If a different CLI version is on
+  the box, it is replaced with the pinned one. To upgrade: bump
+  `AWS_CLI_VERSION`, refresh both per-arch SHA256 values, and review the
+  release's custom-command changes before rolling out.
 - Creates the `awsjail` group, `/etc/awsjail`, `/var/lib/awsjail`, the
   root-owned helper-PATH directory `/usr/local/lib/awsjail/bin`, and an
   empty `/etc/awsjail/roles.json` if one doesn't already exist. Never

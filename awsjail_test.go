@@ -62,6 +62,8 @@ func TestIsCredentialExport(t *testing.T) {
 		{"format process", []string{"aws", "configure", "export-credentials", "--format", "process"}},
 		{"global option before", []string{"aws", "--region", "us-east-1", "configure", "export-credentials", "--format", "env"}},
 		{"global option around", []string{"aws", "--debug", "configure", "--region", "us-east-1", "export-credentials"}},
+		{"option equals form", []string{"aws", "--output=json", "configure", "export-credentials"}},
+		{"option after service", []string{"aws", "configure", "--profile", "ops", "export-credentials"}},
 	}
 	for _, tc := range denied {
 		t.Run("deny/"+tc.name, func(t *testing.T) {
@@ -81,7 +83,10 @@ func TestIsCredentialExport(t *testing.T) {
 		{"reversed order", []string{"aws", "export-credentials", "configure"}},
 		{"no substring match", []string{"aws", "configures", "export-credentialss"}},
 		{"tokens inside values", []string{"aws", "s3", "cp", "s3://b/configure", "s3://b/export-credentials"}},
+		{"bare file names", []string{"aws", "s3", "cp", "configure", "export-credentials"}},
 		{"configure as value", []string{"aws", "iam", "create-access-key", "--user-name", "configure"}},
+		{"configure as option value", []string{"aws", "--profile", "configure", "s3", "ls"}},
+		{"region value shadows nothing", []string{"aws", "--region", "configure", "export-credentials"}},
 	}
 	for _, tc := range allowed {
 		t.Run("allow/"+tc.name, func(t *testing.T) {
@@ -123,6 +128,60 @@ func TestBuildEnvRestrictions(t *testing.T) {
 	}
 	if got := m["AWS_ACCESS_KEY_ID"]; got != "AKID" {
 		t.Fatalf("buildEnv AWS_ACCESS_KEY_ID = %q, want AKID", got)
+	}
+}
+
+func TestIsSensitiveLocalPath(t *testing.T) {
+	const cwd = "/home/alice"
+	denied := []struct {
+		name string
+		argv []string
+	}{
+		{"proc environ to stdout", []string{"aws", "s3", "cp", "/proc/self/environ", "-"}},
+		{"proc via fileb", []string{"aws", "s3api", "put-object", "--body", "fileb:///proc/self/environ", "--bucket", "b", "--key", "k"}},
+		{"proc via file", []string{"aws", "s3", "cp", "file:///proc/self/environ", "s3://b/k"}},
+		{"proc relative traversal", []string{"aws", "s3", "cp", "../../proc/self/environ", "s3://b/k"}},
+		{"proc root", []string{"aws", "s3", "cp", "/proc", "s3://b/k"}},
+		{"sys path", []string{"aws", "s3", "cp", "/sys/class/dmi/id/product_uuid", "-"}},
+		{"proc write target", []string{"aws", "s3", "cp", "s3://b/k", "/proc/self/fd/1"}},
+	}
+	for _, tc := range denied {
+		t.Run("deny/"+tc.name, func(t *testing.T) {
+			if !isSensitiveLocalPath(tc.argv, cwd) {
+				t.Fatalf("isSensitiveLocalPath(%v) = false, want true", tc.argv)
+			}
+		})
+	}
+	allowed := []struct {
+		name string
+		argv []string
+	}{
+		{"tmp upload", []string{"aws", "s3", "cp", "/tmp/backup.tar.gz", "s3://b/k"}},
+		{"home file", []string{"aws", "s3", "cp", "./notes.txt", "s3://b/k"}},
+		{"bare name", []string{"aws", "s3", "cp", "notes.txt", "s3://b/k"}},
+		{"file uri tmp", []string{"aws", "s3", "cp", "file:///tmp/x", "s3://b/k"}},
+		{"s3 uri with proc key", []string{"aws", "s3", "cp", "s3://b/proc/self/environ", "/tmp/x"}},
+		{"path merely containing proc", []string{"aws", "s3", "cp", "/data/proc/self/environ", "s3://b/k"}},
+		{"jmespath query", []string{"aws", "ec2", "describe-instances", "--query", "Reservations[].Instances[]"}},
+	}
+	for _, tc := range allowed {
+		t.Run("allow/"+tc.name, func(t *testing.T) {
+			if isSensitiveLocalPath(tc.argv, cwd) {
+				t.Fatalf("isSensitiveLocalPath(%v) = true, want false", tc.argv)
+			}
+		})
+	}
+}
+
+func TestRunOneDeniedSensitivePath(t *testing.T) {
+	fl := &fakeLogger{}
+	code := runOne("aws s3 cp /proc/self/environ -", nil, fl, "alice", "")
+	if code != 127 {
+		t.Fatalf("runOne(proc environ) = %d, want 127", code)
+	}
+	events := parseEvents(t, fl)
+	if len(events) != 1 || events[0].Action != "denied" || events[0].Reason != "sensitive_path" {
+		t.Fatalf("events = %+v, want denied with reason sensitive_path", events)
 	}
 }
 
@@ -284,5 +343,16 @@ func TestSetupShHardening(t *testing.T) {
 	}
 	if !strings.Contains(s, "install -d -m 0755 -o root -g root /usr/local/lib/awsjail/bin") {
 		t.Fatal("setup.sh: must create /usr/local/lib/awsjail/bin root-owned 0755")
+	}
+	// The AWS CLI must stay pinned and checksum-verified: its custom commands
+	// are part of the jail's attack surface.
+	if !strings.Contains(s, `AWS_CLI_VERSION="`) {
+		t.Fatal("setup.sh: AWS CLI version must be pinned via AWS_CLI_VERSION")
+	}
+	if !strings.Contains(s, "sha256sum -c -") {
+		t.Fatal("setup.sh: AWS CLI download must be checksum-verified")
+	}
+	if !strings.Contains(s, "awscli-exe-linux-${AWSARCH}-${AWS_CLI_VERSION}.zip") {
+		t.Fatal("setup.sh: AWS CLI must use the version-pinned download URL")
 	}
 }
