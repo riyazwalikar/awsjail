@@ -11,12 +11,20 @@
 //     is ever involved, so ; | & $() and backticks are never interpreted. This
 //     is also why JMESPath --query strings with | and backticks work: they are
 //     passed to aws as literal argv.
-//   - Only argv[0] == "aws" is allowed.
-//   - The child environment is built from scratch. AWS_PAGER is empty so the
-//     CLI cannot page output through less (and less cannot spawn a shell).
-//     AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE point at /dev/null so a
-//     user-controlled ~/.aws/config cannot inject credential_process or a
-//     stored profile.
+//   - Only argv[0] == "aws" is allowed, with one exception inside that: `aws
+//     configure export-credentials` is denied, because it exists specifically
+//     to print the credentials awsjail injected into the child environment.
+//   - The child environment is built from scratch. PATH is a dedicated
+//     root-owned helper directory with no general-purpose executables, so AWS
+//     CLI customizations (EMR ssh, CodeArtifact login, ...) cannot discover
+//     system tools like ssh/scp/npm through it. SHELL points at nologin as
+//     defense in depth. AWS_PAGER is empty so the CLI cannot page output
+//     through less (and less cannot spawn a shell). AWS_CONFIG_FILE and
+//     AWS_SHARED_CREDENTIALS_FILE point at /dev/null so a user-controlled
+//     ~/.aws/config cannot inject credential_process or a stored profile.
+//   - Every command is logged to syslog before it executes (command_start) and
+//     again when it finishes (command_finish), so the audit record exists even
+//     if the session is killed mid-command.
 //   - Build with CGO_ENABLED=0 so LD_PRELOAD cannot affect this process.
 package main
 
@@ -27,17 +35,28 @@ import (
 	"log/syslog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 const (
-	awsBin      = "/usr/local/bin/aws"
 	roleMapPath = "/etc/awsjail/roles.json"
 	sessionTTL  = "3600" // seconds; raise up to the role max if needed
 	sessionHome = "/var/lib/awsjail"
+	// helperBin is the only PATH entry the AWS CLI child gets. It is a
+	// root-owned directory, created empty by setup.sh, so CLI customizations
+	// cannot resolve system helpers (ssh, scp, npm, ...) through PATH. Add a
+	// reviewed wrapper here if a legitimate use case ever needs one.
+	helperBin = "/usr/local/lib/awsjail/bin"
+	// noShell is defense in depth for anything in the CLI that consults SHELL.
+	noShell = "/usr/sbin/nologin"
 )
+
+// awsBin is a var, not a const, so tests can point it at a fake CLI.
+var awsBin = "/usr/local/bin/aws"
 
 type roleEntry struct {
 	RoleArn string `json:"role_arn"`
@@ -48,6 +67,13 @@ type creds struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	SessionToken    string
+}
+
+// logger is satisfied by *syslog.Writer and by test fakes.
+type logger interface {
+	Info(string) error
+	Warning(string) error
+	Err(string) error
 }
 
 var sessRe = regexp.MustCompile(`[^\w+=,.@-]`)
@@ -76,14 +102,14 @@ func main() {
 	role, err := loadRole(u.Username)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "awsjail: no role mapping for %q\n", u.Username)
-		sl.Err(logLine(u.Username, src, "", -1, "no_role"))
+		sl.Err(logLine(u.Username, src, "", -1, "no_role", ""))
 		os.Exit(1)
 	}
 
 	c, account, err := assume(role, sessionName(u.Username))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "awsjail: could not obtain credentials: %v\n", err)
-		sl.Err(logLine(u.Username, src, "", -1, "assume_failed"))
+		sl.Err(logLine(u.Username, src, "", -1, "assume_failed", ""))
 		os.Exit(1)
 	}
 	env := buildEnv(c, role.Region)
@@ -152,7 +178,8 @@ func assume(role roleEntry, session string) (creds, string, error) {
 		"--duration-seconds", sessionTTL,
 		"--output", "json")
 	cmd.Env = []string{
-		"PATH=/usr/local/bin:/usr/bin:/bin",
+		"PATH=" + helperBin,
+		"SHELL=" + noShell,
 		"HOME=" + sessionHome,
 		"AWS_REGION=" + role.Region,
 		"AWS_DEFAULT_REGION=" + role.Region,
@@ -197,7 +224,8 @@ func accountFromArn(arn string) string {
 
 func buildEnv(c creds, region string) []string {
 	return []string{
-		"PATH=/usr/local/bin:/usr/bin:/bin",
+		"PATH=" + helperBin,
+		"SHELL=" + noShell,
 		"HOME=" + sessionHome,
 		"AWS_REGION=" + region,
 		"AWS_DEFAULT_REGION=" + region,
@@ -210,12 +238,33 @@ func buildEnv(c creds, region string) []string {
 	}
 }
 
+// isCredentialExport reports whether a parsed aws command is
+// `configure export-credentials`, the CLI's built-in way to print the
+// credentials of the current session. Matching is on exact tokens, in order,
+// tolerating global options anywhere: a token exactly "configure" followed by
+// a later token exactly "export-credentials". It deliberately ignores argv[0]
+// (already known to be "aws") and never substring-matches user values.
+func isCredentialExport(argv []string) bool {
+	seenConfigure := false
+	for _, tok := range argv[1:] {
+		switch tok {
+		case "configure":
+			seenConfigure = true
+		case "export-credentials":
+			if seenConfigure {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // runOne validates and executes a single input line, returning the child exit code.
-func runOne(line string, env []string, sl *syslog.Writer, username, src string) int {
+func runOne(line string, env []string, sl logger, username, src string) int {
 	argv, err := splitArgs(line)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "awsjail: %v\n", err)
-		sl.Warning(logLine(username, src, line, -1, "parse_error"))
+		sl.Warning(logLine(username, src, line, -1, "parse_error", ""))
 		return 2
 	}
 	if len(argv) == 0 {
@@ -224,7 +273,12 @@ func runOne(line string, env []string, sl *syslog.Writer, username, src string) 
 	argv = helpToArgv(argv)
 	if argv[0] != "aws" {
 		fmt.Fprintf(os.Stderr, "%s: command not found (only 'aws' is permitted)\n", argv[0])
-		sl.Warning(logLine(username, src, line, -1, "denied"))
+		sl.Warning(logLine(username, src, line, -1, "denied", ""))
+		return 127
+	}
+	if isCredentialExport(argv) {
+		fmt.Fprintln(os.Stderr, "awsjail: 'aws configure export-credentials' is not permitted")
+		sl.Warning(logLine(username, src, line, -1, "denied", "credential_export"))
 		return 127
 	}
 	cmd := exec.Command(awsBin, argv[1:]...)
@@ -232,16 +286,45 @@ func runOne(line string, env []string, sl *syslog.Writer, username, src string) 
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err = cmd.Run()
+
+	// The audit record is written before control is handed to the child, so
+	// even a command that is killed mid-run has a start event in the log.
+	sl.Info(logLine(username, src, line, -1, "command_start", ""))
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
+
 	code := 0
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else {
-			code = 127
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "awsjail: cannot run aws: %v\n", err)
+		code = 127
+	} else {
+		// Forward termination signals to the child until it exits, so a
+		// signal aimed at awsjail (e.g. sshd tearing down the session)
+		// reaches the actual command.
+		done := make(chan struct{})
+		go func() {
+			for {
+				select {
+				case s := <-sigCh:
+					_ = cmd.Process.Signal(s) // harmless once the child is gone
+				case <-done:
+					return
+				}
+			}
+		}()
+		err = cmd.Wait()
+		close(done)
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			} else {
+				code = 127
+			}
 		}
 	}
-	sl.Info(logLine(username, src, line, code, "run"))
+	sl.Info(logLine(username, src, line, code, "command_finish", ""))
 	return code
 }
 
@@ -253,10 +336,17 @@ func sessionName(u string) string {
 	return s
 }
 
-func logLine(username, src, cmd string, exit int, action string) string {
-	b, _ := json.Marshal(map[string]any{
+// logLine builds one JSON audit record. reason is included only when set
+// (e.g. "credential_export" for a denied export attempt); credential values
+// are never logged.
+func logLine(username, src, cmd string, exit int, action, reason string) string {
+	m := map[string]any{
 		"user": username, "src": src, "cmd": cmd, "exit": exit, "action": action,
-	})
+	}
+	if reason != "" {
+		m["reason"] = reason
+	}
+	b, _ := json.Marshal(m)
 	return string(b)
 }
 

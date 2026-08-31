@@ -110,6 +110,9 @@ fi
 # 5. Directories and roles.json
 install -d -m 0755 -o root -g root /etc/awsjail
 install -d -m 0700 -o root -g root /var/lib/awsjail
+# The only PATH entry the AWS CLI child gets. Stays empty unless a reviewed
+# helper is deliberately added; root-owned so jailed users cannot plant one.
+install -d -m 0755 -o root -g root /usr/local/lib/awsjail/bin
 if [[ -f /etc/awsjail/roles.json ]]; then
   step "roles.json: already exists, leaving it alone"
 else
@@ -186,6 +189,7 @@ Match Group awsjail
     AllowStreamLocalForwarding no
     PermitTunnel no
     PermitOpen none
+    PermitUserRC no
 SSHD
 step "sshd drop-in written to /etc/ssh/sshd_config.d/00-awsjail.conf"
 
