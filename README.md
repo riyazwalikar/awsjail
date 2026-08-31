@@ -84,6 +84,8 @@ steps, and the sshd config: [docs/setup.md](docs/setup.md).
 
 Open a PR via GitHub please! Contributions and enhancements welcome!
 
+See [docs/security.md](docs/security.md) for known security caveats and gotchas.
+
 ## References
 
 - OpenSSH `sshd_config`, `ForceCommand` and the `restrict` key option: https://man.openbsd.org/sshd_config
