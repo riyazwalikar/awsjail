@@ -79,7 +79,6 @@ steps, and the sshd config: [docs/setup.md](docs/setup.md).
 - [docs/setup.md](docs/setup.md) — build, host setup, `setup.sh`, the break-glass account, `awsjail-admin`, sshd hardening.
 - [docs/iam.md](docs/iam.md) — credential model, the IAM policies for the instance and tier roles, and which AWS capabilities are deliberately left to IAM.
 - [docs/security.md](docs/security.md) — logging layers, network requirements, traps the design handles, known limitations and caveats, and the v2 hardening roadmap.
-- [spec.md](spec.md) — the full design spec: parser, environment contract, escape-vector catalog, interfaces, failure modes.
 
 ## Reporting security issues
 
